@@ -1,0 +1,248 @@
+import open3d as o3d
+import numpy as np
+import cv2
+
+import os
+import numpy as np
+import struct
+import open3d
+import time
+
+from open3d import visualization
+
+
+def read_bin_velodyne(path):
+    pc_list = []
+    with open(path, 'rb') as f:
+        content = f.read()
+        pc_iter = struct.iter_unpack('ffff', content)
+        for idx, point in enumerate(pc_iter):
+            pc_list.append([point[0], point[1], point[2]])
+    return np.asarray(pc_list, dtype=np.float32)
+
+def save_view_point(pcd, filename):
+    vis = visualization.Visualizer()
+    vis.create_window(window_name='pcd', width=1021, height=1080)
+    vis.add_geometry(pcd)
+
+    #vis.get_render_option().load_from_json('renderoption.json')
+    vis.run()  # user changes the view and press "q" to terminate
+    param = vis.get_view_control().convert_to_pinhole_camera_parameters()
+    open3d.io.write_pinhole_camera_parameters(filename, param)
+    #vis.destroy_window()
+
+def load_view_point(pcd, filename):
+    vis = visualization.Visualizer()
+    vis.create_window(window_name='pcd')
+    ctr = vis.get_view_control()
+    param = open3d.io.read_pinhole_camera_parameters(filename)
+    vis.add_geometry(pcd)
+    vis.get_render_option().load_from_json(filename)
+    ctr.convert_from_pinhole_camera_parameters(param)
+    vis.run()
+    vis.destroy_window()
+
+
+
+def vh_fit(voxel_shape, xyz_max, xyz_min, input_masks, input_poses, Ks):
+    K = Ks
+    K[0, 0] = -1 * K[0, 0]
+    #input_poses = input_poses.cpu().numpy()
+    # xyz_min = xyz_min.cpu().numpy()
+    # xyz_max = xyz_max.cpu().numpy()
+
+    xyz = np.stack(np.meshgrid(
+        np.linspace(xyz_min[0], xyz_max[0], voxel_shape[0]),
+        np.linspace(xyz_min[1], xyz_max[1], voxel_shape[0]),
+        np.linspace(xyz_min[2], xyz_max[2], voxel_shape[2]),
+        indexing="ij"), -1)
+    ones = np.ones(xyz.shape[:-1])[:,:,:,np.newaxis]
+    xyz_add = np.concatenate((xyz, ones), axis=3)[...,np.newaxis]
+    Nx, Ny, Nz = xyz.shape[:3]
+    voxels_count = np.zeros((Nx, Ny, Nz), dtype=np.int32)
+
+
+    for i in range(input_poses.shape[0]):
+        print("第 {} 张图片".format(i))
+        # read mask w2c KT
+        mask = input_masks[i,...]   #加入图像膨胀
+
+        mask[0, 0] = 0
+        # cv2.imshow("mask", (mask * 240).astype(np.uint8))
+        # cv2.waitKey(100)
+        kernel = np.ones((2, 2), np.uint8)
+        mask= cv2.dilate(mask, kernel, 1)
+        print("pengzhang")
+        # cv2.imshow("mask", (mask * 240).astype(np.uint8))
+        # cv2.waitKey(100)
+
+        c2w = input_poses[i, :, :]
+        w2c = np.linalg.inv(c2w)[0:3, :]
+        KT = np.dot(K, w2c)
+
+        KT_add = KT[np.newaxis, np.newaxis, np.newaxis, :, :] # 1 * 1 * 11 * 3  * 4
+        points2D = np.matmul(KT_add, xyz_add) # 215 * 126 * 152 * 3 * 1 #投影到了成像平面上
+        Z = np.concatenate((points2D[:,:,:,2,:], points2D[:,:,:,2,:], points2D[:,:,:,2,:]), axis=3)[...,np.newaxis] # 215 * 126 * 152 * 3 * 1
+        points2D = points2D / Z  # 215 * 126 * 152 * 3 * 1
+        points2D = points2D.squeeze(axis=-1) # 215 * 126 * 152 * 3 #投影到了归一化平面上
+
+        # remove out image
+        points2D_uv = points2D[..., :2] # 215 * 126 * 152 * 2
+        points2D_uv_in = (points2D_uv < (300-1)) & (points2D_uv > 0)
+        points2D_uv_in = points2D_uv_in[..., 0] & points2D_uv_in[..., 1]
+        points2D_uv_in = np.stack((points2D_uv_in, points2D_uv_in), axis=-1)
+        points2D_uv_remain = points2D_uv * points2D_uv_in # 215 * 126 * 152 * 2
+
+        # int index
+        points2D_uv_remain_int = np.floor(points2D_uv_remain).astype(np.int32)
+
+        # index mask
+        fb_val_point3D = mask[points2D_uv_remain_int[...,1], points2D_uv_remain_int[...,0]] # 215 * 126 * 152
+        remain_point3D_index = (fb_val_point3D > 0) # L,W,H
+
+
+        # visual num count
+        voxels_count = voxels_count + remain_point3D_index
+
+    cv2.destroyAllWindows()
+
+
+    VH_bool = (voxels_count == voxels_count.max())
+
+    print(VH_bool.shape)
+    points_vh = xyz[VH_bool.nonzero()]
+    pcd_vh = o3d.geometry.PointCloud()
+    pcd_vh.points = o3d.utility.Vector3dVector(points_vh)
+
+    pcd_vh.paint_uniform_color([1, 0.706, 0])
+
+    voxel_grid_vh = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd_vh, voxel_size=0.011)
+    o3d.visualization.draw_geometries([voxel_grid_vh])
+
+
+    return VH_bool
+
+
+def vh_fit_color(voxel_shape, xyz_max, xyz_min, input_masks, input_poses, Ks, input_images):
+    K = Ks
+    K[0, 0] = -1 * K[0, 0]
+
+    xyz = np.stack(np.meshgrid(
+        np.linspace(xyz_min[0], xyz_max[0], voxel_shape[0]),
+        np.linspace(xyz_min[1], xyz_max[1], voxel_shape[1]),
+        np.linspace(xyz_min[2], xyz_max[2], voxel_shape[2]),
+        indexing="ij"), -1)
+    ones = np.ones(xyz.shape[:-1])[:,:,:,np.newaxis]
+    xyz_add = np.concatenate((xyz, ones), axis=3)[...,np.newaxis]
+    Nx, Ny, Nz = xyz.shape[:3]
+    voxels_count = np.zeros((Nx, Ny, Nz), dtype=np.int32)
+
+    color_point3D = np.zeros([voxel_shape[0], voxel_shape[1], voxel_shape[2], 3])
+
+
+    for i in range(input_poses.shape[0]):
+        print("第 {} 张图片".format(i))
+        # read mask w2c KT
+        mask = input_masks[i,...]   #加入图像膨胀
+        image = input_images[i, ...]
+        mask[0, 0] = 0
+        # cv2.imshow("mask", (mask * 240).astype(np.uint8))
+        # cv2.waitKey(100)
+        kernel = np.ones((5, 5), np.uint8)
+        mask= cv2.dilate(mask, kernel, 3)
+        # cv2.imshow("mask_pengzhang", (mask * 240).astype(np.uint8))
+        # cv2.waitKey(100)
+
+        c2w = input_poses[i, :, :]
+        w2c = np.linalg.inv(c2w)[0:3, :]
+        KT = np.dot(K, w2c)
+
+        KT_add = KT[np.newaxis, np.newaxis, np.newaxis, :, :] # 1 * 1 * 11 * 3  * 4
+        points2D = np.matmul(KT_add, xyz_add) # 215 * 126 * 152 * 3 * 1 #投影到了成像平面上
+        Z = np.concatenate((points2D[:,:,:,2,:], points2D[:,:,:,2,:], points2D[:,:,:,2,:]), axis=3)[...,np.newaxis] # 215 * 126 * 152 * 3 * 1
+        points2D = points2D / Z  # 215 * 126 * 152 * 3 * 1
+        points2D = points2D.squeeze(axis=-1) # 215 * 126 * 152 * 3 #投影到了归一化平面上
+
+        # remove out image
+        points2D_uv = points2D[..., :2] # 215 * 126 * 152 * 2
+        # points2D_uv_in = (points2D_uv < (300-1)) & (points2D_uv > 0)
+        points2D_u_in = (points2D_uv[..., 0] < (400-1)) & (points2D_uv[..., 0] > 0)
+        points2D_v_in = (points2D_uv[..., 1] < (300-1)) & (points2D_uv[..., 1] > 0)
+        points2D_uv_in = points2D_u_in & points2D_v_in
+        points2D_uv_in = np.stack((points2D_uv_in, points2D_uv_in), axis=-1)
+        points2D_uv_remain = points2D_uv * points2D_uv_in # 215 * 126 * 152 * 2
+
+        # int index
+        points2D_uv_remain_int = np.floor(points2D_uv_remain).astype(np.int32)
+
+        # index mask
+        fb_val_point3D = mask[points2D_uv_remain_int[...,1], points2D_uv_remain_int[...,0]] # 215 * 126 * 152
+        color_point3D = color_point3D + image[points2D_uv_remain_int[...,1], points2D_uv_remain_int[...,0]]
+
+        remain_point3D_index = (fb_val_point3D > 0) # L,W,H
+
+
+        # visual num count
+        voxels_count = voxels_count + remain_point3D_index
+
+
+    color_point3D = color_point3D / input_poses.shape[0]
+
+    cv2.destroyAllWindows()
+
+
+    VH_bool = (voxels_count == voxels_count.max())
+
+    print(VH_bool.shape)
+    points_vh = xyz[VH_bool.nonzero()]
+    colors_vh = color_point3D[VH_bool.nonzero()]
+    pcd_vh = o3d.geometry.PointCloud()
+    pcd_vh.points = o3d.utility.Vector3dVector(points_vh)
+    # 打印点云的三个方向的坐标的最大值和最小值
+    xyz_min = (float(np.min(points_vh[:, 0])), float(np.min(points_vh[:, 1])), float(np.min(points_vh[:, 2])))
+    xyz_max = (float(np.max(points_vh[:, 0])), float(np.max(points_vh[:, 1])), float(np.max(points_vh[:, 2])))
+
+    pcd_vh.colors = o3d.utility.Vector3dVector(colors_vh)
+
+    # voxel_grid_vh = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd_vh, voxel_size=0.011)
+    # o3d.visualization.draw_geometries([voxel_grid_vh])
+
+
+    return VH_bool, pcd_vh, xyz_min, xyz_max
+
+if __name__ == "__main__":
+    import sys,os
+    import torch
+    sys.path.append(os.path.dirname(__file__) + os.sep + '../')
+    from lib.load_DTU import load_DTU
+    from lib.load_blender import load_blender_data
+
+
+    images, poses, render_poses, hwf, masks, Ks, depths_train = load_DTU('../data/rs_dtu_4/DTU_Direct/scan63')
+
+
+    i_train = np.array([22, 25, 28, 40, 44, 48, 0, 8, 13])
+    #i_train = np.arange(0, 49)
+    # i_val = np.array([3, 8, 16, 22, 47])
+    # i_test = np.delete(np.arange(0, 49), [22, 25, 28])
+
+
+    voxel_shape = [100, 100, 100]
+
+    # xyz_min = np.array([-0.4605, -0.6428, -0.5882])
+    # xyz_max = np.array([0.8288, 0.3306, 0.6199])
+    xyz_min = np.array([-1, -1, -1])
+    xyz_max = np.array([1, 1, 1])
+
+    # 0.3737373737373739 - 0.4545454545454545
+    # 0.21212121212121215 - 0.4949494949494949
+    # 0.49494949494949503 - 0.3737373737373737
+
+
+    VH_bool, pcd_100, xyz_min, xyz_max = vh_fit_color(voxel_shape, xyz_max, xyz_min, masks[i_train], poses[i_train], Ks, images[i_train])
+    print(VH_bool.shape)
+    print(xyz_min)
+    print(xyz_max)
+
+
+

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 
 '''Model'''
-class DirectVoxGO(torch.nn.Module):
+class VoxelGrid(torch.nn.Module):
     def __init__(self, xyz_min, xyz_max,
                  num_voxels=0, num_voxels_base=0,
                  alpha_init=None,
@@ -20,7 +20,7 @@ class DirectVoxGO(torch.nn.Module):
                  rgbnet_depth=3, rgbnet_width=128,
                  posbase_pe=5, viewbase_pe=4,
                  **kwargs):
-        super(DirectVoxGO, self).__init__()
+        super(VoxelGrid, self).__init__()
         self.register_buffer('xyz_min', torch.Tensor(xyz_min))
         self.register_buffer('xyz_max', torch.Tensor(xyz_max))
         self.fast_color_thres = fast_color_thres
@@ -102,6 +102,32 @@ class DirectVoxGO(torch.nn.Module):
         else:
             self.mask_cache = None
             self.nonempty_mask = None
+
+        if VH_bool is not None:
+            self._set_visualhull_mask(VH_bool)
+
+    # TODO: 使用visual hull来mask
+    @torch.no_grad()
+    def _set_visualhull_mask(self, VH_bool):
+        # Find grid points that is inside nonempty (occupied) space
+        self_grid_xyz = torch.stack(torch.meshgrid(
+            torch.linspace(self.xyz_min[0], self.xyz_max[0], self.density.shape[2]),
+            torch.linspace(self.xyz_min[1], self.xyz_max[1], self.density.shape[3]),
+            torch.linspace(self.xyz_min[2], self.xyz_max[2], self.density.shape[4]),
+        ), -1)
+
+        shape = self_grid_xyz.shape[:-1]
+        xyz = self_grid_xyz.reshape(1,1,1,-1,3)
+        ind_norm = ((xyz - self.xyz_min) / (self.xyz_max - self.xyz_min)).flip((-1,)) * 2 - 1
+
+        # 将vh_bool 转化为torch float tensor
+        vh_bool = torch.from_numpy(VH_bool).float().to(xyz.device)
+        vh_bool = vh_bool[None, None]
+        density = F.grid_sample(vh_bool, ind_norm, align_corners=True)
+        density = density.reshape(*shape)
+        thres = 0.01
+        nonempty_mask = (density <= thres)[None, None]
+        self.density[~nonempty_mask] = -100
 
     def _set_grid_resolution(self, num_voxels):
         # Determine grid resolution
@@ -603,7 +629,3 @@ def batch_indices_generator(N, BS):
             idx, top = torch.LongTensor(np.random.permutation(N)), 0
         yield idx[top:top+BS]
         top += BS
-
-
-
-

@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lib import utils, dvgo
+from lib import utils, vgce
 from lib.load_data import load_data
 
 import os
@@ -88,7 +88,7 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
 
         H, W = HW[i]
         K = Ks[i]
-        rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
+        rays_o, rays_d, viewdirs = vgce.get_rays_of_a_view(
             H, W, K, c2w, ndc, inverse_y=render_kwargs['inverse_y'],
             flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
         keys = ['rgb_marched', 'disp', 'mask', 'depth']
@@ -224,7 +224,7 @@ def compute_bbox_by_cam_frustrm(args, cfg, HW, Ks, poses, i_train, near, far, **
     xyz_min = torch.Tensor([np.inf, np.inf, np.inf])
     xyz_max = -xyz_min
     for (H, W), K, c2w in zip(HW[i_train], Ks[i_train], poses[i_train]):
-        rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
+        rays_o, rays_d, viewdirs = vgce.get_rays_of_a_view(
             H=H, W=W, K=K, c2w=c2w,
             ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
             flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
@@ -290,7 +290,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     num_voxels = model_kwargs.pop('num_voxels')
     if len(cfg_train.pg_scale) and reload_ckpt_path is None:
         num_voxels = int(num_voxels / (2**len(cfg_train.pg_scale)))
-    model = dvgo.DirectVoxGO(
+    model = vgce.VoxelGrid(
         xyz_min=xyz_min, xyz_max=xyz_max,
         num_voxels=num_voxels,
         mask_cache_path=coarse_ckpt_path,
@@ -330,7 +330,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             rgb_tr_ori = images[i_train].to('cpu' if cfg.data.load2gpu_on_the_fly else device)
 
         if cfg_train.ray_sampler == 'in_maskcache':
-            rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays_in_maskcache_sampling(
+            rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = vgce.get_training_rays_in_maskcache_sampling(
                 rgb_tr_ori=rgb_tr_ori,
                 train_poses=poses[i_train],
                 HW=HW[i_train], Ks=Ks[i_train],
@@ -338,18 +338,18 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y,
                 model=model, render_kwargs=render_kwargs)
         elif cfg_train.ray_sampler == 'flatten':
-            rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays_flatten(
+            rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = vgce.get_training_rays_flatten(
                 rgb_tr_ori=rgb_tr_ori,
                 train_poses=poses[i_train],
                 HW=HW[i_train], Ks=Ks[i_train], ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
         else:
-            rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = dvgo.get_training_rays(
+            rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz = vgce.get_training_rays(
                 rgb_tr=rgb_tr_ori,
                 train_poses=poses[i_train],
                 HW=HW[i_train], Ks=Ks[i_train], ndc=cfg.data.ndc, inverse_y=cfg.data.inverse_y,
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y)
-        index_generator = dvgo.batch_indices_generator(len(rgb_tr), cfg_train.N_rand)
+        index_generator = vgce.batch_indices_generator(len(rgb_tr), cfg_train.N_rand)
         batch_index_sampler = lambda: next(index_generator)
         return rgb_tr, rays_o_tr, rays_d_tr, viewdirs_tr, imsz, batch_index_sampler
 
@@ -527,54 +527,55 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
 
 def train(args, cfg, data_dict):
 
-    # 增加ssim lpips的指标计算
     args.eval_ssim = True
     args.eval_lpips_alex = True
     args.eval_lpips_vgg = True
 
-
     # init
     print('train: start')
-    eps_time = time.time()
-    os.makedirs(os.path.join(cfg.basedir, cfg.expname), exist_ok=True) # 创建logs保存文件夹
+    vh_voxel_shape = [100, 100, 100]
+    vh_xyz_min = np.array([-1, -1, -1])
+    vh_xyz_max = np.array([1, 1, 1])
+    from lib.vh_fit import vh_fit_color
+    from copy import deepcopy
+    Ks,  i_train, poses, images, masks = [
+        data_dict[k] for k in [
+            'Ks', 'i_train', 'poses', 'images', 'masks'
+        ]
+    ]
+
+    Ks_vh = deepcopy(Ks)
+    i_train_vh = deepcopy(i_train)
+    poses_vh = deepcopy(poses)
+    images_vh = deepcopy(images)
+    print(type(images_vh))
+    masks_vh = deepcopy(masks)
+
+    masks_vh = masks_vh[..., np.newaxis]
+    images_vh_np = images_vh.cpu().numpy()
+    poses_vh_np = poses_vh.cpu().numpy()
+    print(Ks_vh[0] == Ks_vh[1])
+    vh_bool, pcd_100, xyz_min, xyz_max = vh_fit_color(vh_voxel_shape, vh_xyz_max, vh_xyz_min, masks_vh[i_train_vh], poses_vh_np[i_train_vh], Ks_vh[0],
+                                                        images_vh_np[i_train_vh])
+    print('train: xyz_min_vh', xyz_min)
+    print('train: xyz_max_vh', xyz_max)
+    xyz_min =  torch.tensor(xyz_min)
+    xyz_max =  torch.tensor(xyz_max)
+
+    os.makedirs(os.path.join(cfg.basedir, cfg.expname), exist_ok=True)
     with open(os.path.join(cfg.basedir, cfg.expname, 'args.txt'), 'w') as file:
         for arg in sorted(vars(args)):
             attr = getattr(args, arg)
             file.write('{} = {}\n'.format(arg, attr))
     cfg.dump(os.path.join(cfg.basedir, cfg.expname, 'config.py'))
 
-    # coarse geometry searching
-    eps_coarse = time.time()
-    xyz_min_coarse, xyz_max_coarse = compute_bbox_by_cam_frustrm(args=args, cfg=cfg, **data_dict) # 计算bbox
-    #xyz_min_coarse, xyz_max_coarse = torch.Tensor([-0.6873, -1.1329, -0.6100]), torch.Tensor([0.6762, 1.1971, 1.0340])
     scene_rep_reconstruction(
-        args=args, cfg=cfg,
-        cfg_model=cfg.coarse_model_and_render, cfg_train=cfg.coarse_train,
-        xyz_min=xyz_min_coarse, xyz_max=xyz_max_coarse,
-        data_dict=data_dict, stage='coarse')
-    eps_coarse = time.time() - eps_coarse
-    eps_time_str = f'{eps_coarse//3600:02.0f}:{eps_coarse//60%60:02.0f}:{eps_coarse%60:02.0f}'
-    print('train: coarse geometry searching in', eps_time_str)
-
-    # fine detail reconstruction
-    eps_fine = time.time()
-    coarse_ckpt_path = os.path.join(cfg.basedir, cfg.expname, f'coarse_last.tar')
-    xyz_min_fine, xyz_max_fine = compute_bbox_by_coarse_geo(
-        model_class=dvgo.DirectVoxGO, model_path=coarse_ckpt_path,
-        thres=cfg.fine_model_and_render.bbox_thres)
-    scene_rep_reconstruction(
-        args=args, cfg=cfg,
-        cfg_model=cfg.fine_model_and_render, cfg_train=cfg.fine_train,
-        xyz_min=xyz_min_fine, xyz_max=xyz_max_fine,
-        data_dict=data_dict, stage='fine',
-        coarse_ckpt_path=coarse_ckpt_path)
-    eps_fine = time.time() - eps_fine
-    eps_time_str = f'{eps_fine//3600:02.0f}:{eps_fine//60%60:02.0f}:{eps_fine%60:02.0f}'
-    print('train: fine detail reconstruction in', eps_time_str)
-
-    eps_time = time.time() - eps_time
-    eps_time_str = f'{eps_time//3600:02.0f}:{eps_time//60%60:02.0f}:{eps_time%60:02.0f}'
-    print('train: finish (eps time', eps_time_str, ')')
+            args=args, cfg=cfg,
+            cfg_model=cfg.fine_model_and_render, cfg_train=cfg.fine_train,
+            xyz_min=xyz_min, xyz_max=xyz_max,
+            data_dict=data_dict, stage='fine',
+            coarse_ckpt_path=None,
+            vh_bool=vh_bool)
 
 
 if __name__=='__main__':
@@ -603,7 +604,7 @@ if __name__=='__main__':
         near, far = data_dict['near'], data_dict['far']
         cam_lst = []
         for c2w, (H, W), K in zip(poses[i_train], HW[i_train], Ks[i_train]):
-            rays_o, rays_d, viewdirs = dvgo.get_rays_of_a_view(
+            rays_o, rays_d, viewdirs = vgce.get_rays_of_a_view(
                 H, W, K, c2w, cfg.data.ndc, inverse_y=cfg.data.inverse_y,
                 flip_x=cfg.data.flip_x, flip_y=cfg.data.flip_y,)
             cam_o = rays_o[0,0].cpu().numpy()
@@ -620,7 +621,7 @@ if __name__=='__main__':
         print('Export coarse visualization...')
         with torch.no_grad():
             ckpt_path = os.path.join(cfg.basedir, cfg.expname, 'coarse_last.tar')
-            model = utils.load_model(dvgo.DirectVoxGO, ckpt_path).to(device)
+            model = utils.load_model(vgce.VoxelGrid, ckpt_path).to(device)
             alpha = model.activate_density(model.density).squeeze().cpu().numpy()
             rgb = torch.sigmoid(model.k0).squeeze().permute(1,2,3,0).cpu().numpy()
         np.savez_compressed(args.export_coarse_only, alpha=alpha, rgb=rgb)
@@ -638,7 +639,7 @@ if __name__=='__main__':
         else:
             ckpt_path = os.path.join(cfg.basedir, cfg.expname, 'fine_last.tar')
         ckpt_name = ckpt_path.split('/')[-1][:-4]
-        model = utils.load_model(dvgo.DirectVoxGO, ckpt_path).to(device)
+        model = utils.load_model(vgce.VoxelGrid, ckpt_path).to(device)
         stepsize = cfg.fine_model_and_render.stepsize
         render_viewpoints_kwargs = {
             'model': model,
@@ -704,7 +705,7 @@ if __name__=='__main__':
     if args.export_pointcloud:
         ckpt_path = os.path.join(cfg.basedir, cfg.expname, 'fine_last.tar')
         ckpt_name = ckpt_path.split('/')[-1][:-4]
-        model = utils.load_model(dvgo.DirectVoxGO, ckpt_path).to(device)
+        model = utils.load_model(vgce.VoxelGrid, ckpt_path).to(device)
         stepsize = cfg.fine_model_and_render.stepsize
         render_viewpoints_kwargs = {
             'model': model,
